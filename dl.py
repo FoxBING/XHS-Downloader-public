@@ -14,6 +14,7 @@ PROJECT_ROOT = ROOT
 TXT_FILE_PATH = PROJECT_ROOT / "1.txt"
 FAILED_TXT_PATH = PROJECT_ROOT / "failed.txt"
 EXPLORE_DB_PATH = VOLUME / "ExploreID.db"
+RECORDS_DB_PATH = VOLUME / "DownloadRecords.db"
 
 
 class Tee:
@@ -34,6 +35,99 @@ class Tee:
         self.log_file.flush()
 
 
+def init_records_db():
+    """创建作者/日期记录库（独立于原作者的 ExploreID.db）"""
+    with sqlite3.connect(str(RECORDS_DB_PATH)) as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS downloads (
+            note_id TEXT PRIMARY KEY,
+            author_id TEXT,
+            author_name TEXT,
+            post_date TEXT,
+            download_time TEXT)"""
+        )
+
+
+def backfill_records_from_folder():
+    """回填：扫描 Download 目录，把磁盘上已有但未记录的作品补进记录库（下载时间取文件时间戳）
+    兼容两种文件命名：带作品ID的（…_作者_ID_N.ext）和不带的（…_作者_标题_N.ext，用文件名做伪ID去重）"""
+    dl_dir = VOLUME / "Download"
+    if not dl_dir.is_dir():
+        return 0
+    added = 0
+    with sqlite3.connect(str(RECORDS_DB_PATH)) as conn:
+        for d in dl_dir.iterdir():
+            dm = re.match(r"([0-9a-f]{24})_(.+)", d.name)
+            if not (dm and d.is_dir()):
+                continue
+            for f in d.rglob("*"):
+                if not f.is_file():
+                    continue
+                pm = re.match(r"(\d{4}-\d{2}-\d{2})", f.name)
+                im = re.search(r"_([0-9a-f]{24})(?:_\d+)?\.[a-z0-9]+$", f.name)
+                # 去掉结尾的 _序号.扩展名，作为无ID文件的伪作品ID
+                base = re.sub(r"(?:_\d+)?\.[a-z0-9]+$", "", f.name)
+                note_id = im.group(1) if im else f"f:{base}"
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO downloads VALUES (?,?,?,?,?)",
+                    (
+                        note_id,
+                        dm.group(1),
+                        dm.group(2),
+                        pm.group(1) if pm else None,
+                        datetime.fromtimestamp(f.stat().st_mtime).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    ),
+                )
+                added += cur.rowcount
+    return added
+
+
+def record_download(note_id, since):
+    """下载成功后，找出本轮处理期间新落盘的文件，从所在文件夹记录作者、从文件名记录发布日期"""
+    dl_dir = VOLUME / "Download"
+    files = [
+        f
+        for f in dl_dir.rglob("*")
+        if f.is_file() and f.stat().st_mtime >= since
+    ]
+    if not files:
+        return None
+    author_id = author_name = post_date = None
+    dm = re.match(r"([0-9a-f]{24})_(.+)", files[0].parent.name)
+    if dm:
+        author_id, author_name = dm.group(1), dm.group(2)
+    pm = re.match(r"(\d{4}-\d{2}-\d{2})", files[0].name)
+    if pm:
+        post_date = pm.group(1)
+    with sqlite3.connect(str(RECORDS_DB_PATH)) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO downloads VALUES (?,?,?,?,?)",
+            (
+                note_id,
+                author_id,
+                author_name,
+                post_date,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+    return author_name, post_date
+
+
+def print_stats():
+    """按频道统计：作品数、文件涉及最新发布日期、最近下载时间"""
+    with sqlite3.connect(str(RECORDS_DB_PATH)) as conn:
+        rows = conn.execute(
+            """SELECT author_name, COUNT(*), MAX(post_date), MAX(download_time)
+            FROM downloads GROUP BY author_id ORDER BY 2 DESC"""
+        ).fetchall()
+    print(f"{'频道':<16}{'作品数':>5}   最新作品发布   最近下载时间")
+    for name, n, latest_post, latest_dl in rows:
+        print(f"{(name or '?')[:14]:<16}{n:>5}   {latest_post or '?'}     {latest_dl or '?'}")
+    print(f"\n共 {len(rows)} 个频道, {sum(r[1] for r in rows)} 个作品")
+
+
 def extract_id_from_url(url):
     # 兼容 /explore/{id}、/item/{id}、/discovery/item/{id}、/user/profile/{uid}/{id} 格式
     match = re.search(r'(?:/(?:explore|item)|/user/profile/[a-f0-9]+)/([a-f0-9]+)', url)
@@ -52,9 +146,10 @@ def read_downloaded_ids():
         conn.close()
 
 
-def read_links_from_1txt():
+def read_links_from_1txt(path=None):
+    path = path or TXT_FILE_PATH
     try:
-        with open(TXT_FILE_PATH, 'r', encoding='utf-8') as f:
+        with open(path, "r", encoding="utf-8") as f:
             content = f.read().strip()
         lines = content.split('\n')
         links = []
@@ -65,18 +160,18 @@ def read_links_from_1txt():
                     links.append(part.strip())
         return links
     except Exception as e:
-        print(f"读取1.txt文件出错: {e}")
+        print(f"读取链接文件出错: {e}")
         return []
 
 
-def save_failed_links(failed_links):
+def save_failed_links(failed_links, path=FAILED_TXT_PATH):
     if not failed_links:
         return
     try:
-        with open(FAILED_TXT_PATH, 'w', encoding='utf-8') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             for link in failed_links:
                 f.write(link + '\n')
-        print(f"\n已将 {len(failed_links)} 个失败链接保存到 {FAILED_TXT_PATH}")
+        print(f"\n已将 {len(failed_links)} 个失败链接保存到 {path}")
     except Exception as e:
         print(f"保存失败链接出错: {e}")
 
@@ -138,16 +233,31 @@ async def download_link(xhs, link):
             return False, False, 0
 
 
-async def main():
+async def main(txt_file="1.txt"):
+    txt_path = Path(txt_file)
+    if not txt_path.is_absolute():
+        txt_path = PROJECT_ROOT / txt_path
+    # 默认 1.txt 的失败链接仍写入 failed.txt；其他文件对应 <名>_failed.txt
+    if txt_file == "1.txt":
+        failed_path = FAILED_TXT_PATH
+    else:
+        failed_path = txt_path.parent / f"{txt_path.stem}_failed.txt"
+
     print(f"{'='*60}")
     print(f"小红书随机间隔批量下载器 - 直接调用API")
+    print(f"链接文件: {txt_path.name}")
     print(f"下载间隔: 随机 2-5 分钟，每 20 个链接长休息 10-20 分钟")
     print(f"{'='*60}")
 
-    links = read_links_from_1txt()
+    links = read_links_from_1txt(txt_path)
     if not links:
         print("\n错误：未找到有效链接或文件读取失败！")
         return
+
+    init_records_db()
+    added = backfill_records_from_folder()
+    if added:
+        print(f"\n已回填 {added} 条磁盘既有作品的作者/日期记录")
 
     print(f"\n成功读取到 {len(links)} 个链接")
 
@@ -190,11 +300,17 @@ async def main():
             print(f"\n{'-'*60}")
             print(f"[{datetime.now():%m-%d %H:%M:%S}] 开始处理链接 {i}/{len(links)}")
 
+            t0 = datetime.now().timestamp()
             success, skipped, file_count = await download_link(xhs, link)
             total_files += file_count
 
             if success:
                 success_count += 1
+                nid = extract_id_from_url(link)
+                if nid:
+                    rec = record_download(nid, t0)
+                    if rec:
+                        print(f"已记录: {rec[0]} {rec[1]}")
             elif skipped:
                 skip_count += 1
             else:
@@ -235,15 +351,22 @@ async def main():
     print(f"文件: 实际下载 {total_files} 个")
     print(f"{'='*60}")
 
-    save_failed_links(failed_links)
+    save_failed_links(failed_links, failed_path)
 
 
 if __name__ == "__main__":
-    log_dir = VOLUME / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"dl_{datetime.now():%Y%m%d_%H%M%S}.log"
-    with open(log_path, "w", encoding="utf-8") as log_file, redirect_stdout(
-        Tee(sys.stdout, log_file)
-    ):
-        asyncio.run(main())
-        print(f"\n本次运行日志: {log_path}")
+    args = sys.argv[1:]
+    if "--stats" in args:
+        init_records_db()
+        backfill_records_from_folder()
+        print_stats()
+    else:
+        txt_file = next((a for a in args if not a.startswith("-")), "1.txt")
+        log_dir = VOLUME / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"dl_{datetime.now():%Y%m%d_%H%M%S}.log"
+        with open(log_path, "w", encoding="utf-8") as log_file, redirect_stdout(
+            Tee(sys.stdout, log_file)
+        ):
+            asyncio.run(main(txt_file))
+            print(f"\n本次运行日志: {log_path}")

@@ -45,7 +45,8 @@ dl.py（我的调度器）
 ├── failed.txt            # 输出：下载失败的链接
 ├── dl.py                 # 我的批量下载器
 └── Volume/
-    ├── ExploreID.db      # 下载记录库（原作者自动维护）
+    ├── ExploreID.db      # 下载记录库（原作者自动维护，只存作品ID）
+    ├── DownloadRecords.db # dl.py 自己的记录库（作者、发布日期、下载时间），python dl.py --stats 查看频道统计
     ├── ExploreData.db    # 作品数据库（可选，record_data=True时）
     └── settings.json     # 配置文件（cookie、UA、代理等）
 ```
